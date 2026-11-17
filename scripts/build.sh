@@ -8,18 +8,11 @@ cd "$project_dir"
 
 source "${script_dir}/config.sh"
 
-cache_dir="${XDG_CACHE_HOME:-$HOME/.cache}/${APP_NAME,,}"
-mkdir -p "$cache_dir"
-
-sdk_file="${cache_dir}/sdk_path.tmp"
-xcrun --show-sdk-path >"$sdk_file" 2>/dev/null
-if [[ ! -s "$sdk_file" ]]; then
-    rm -f "$sdk_file"
+sdk_path="$(xcrun --show-sdk-path 2>/dev/null || true)"
+if [[ -z "$sdk_path" ]]; then
     printf '%s\n' "Error: Failed to obtain SDK path from xcrun" >&2
     exit 1
 fi
-IFS= read -r sdk_path <"$sdk_file"
-rm -f "$sdk_file"
 
 if [[ ! "$VERSION" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
     printf '%s\n' "Error: VERSION file must contain a version like 1.2.3 (found '${VERSION}')" >&2
@@ -43,6 +36,8 @@ contents_dir="${app_dir}/Contents"
 macos_dir="${contents_dir}/MacOS"
 resources_dir="${contents_dir}/Resources"
 
+# Start from an empty bundle so files removed from Resources/ do not linger.
+rm -rf "$app_dir"
 mkdir -p "$macos_dir" "$resources_dir"
 
 if [[ -d "Resources" ]]; then
@@ -59,13 +54,32 @@ while IFS= read -r file; do
     sources+=("$file")
 done < <(find Sources/App -type f -name "*.swift" | sort)
 
-printf '%s\n' "Compiling ${app_name} v${VERSION} (Build ${BUILD_NUMBER}) (${#sources[@]} source files)..."
-swiftc -sdk "$sdk_path" \
-    -O \
-    -whole-module-optimization \
-    -Xlinker -dead_strip \
-    "${sources[@]}" \
-    -o "${macos_dir}/${app_name}"
+# Universal binary: one slice per architecture, merged with lipo, so the same app runs
+# natively on Apple silicon and Intel Macs. Override with ARCHS="arm64" for a quick local build.
+read -r -a archs <<<"${ARCHS}"
+obj_dir="${build_dir}/obj"
+rm -rf "$obj_dir"
+mkdir -p "$obj_dir"
+
+slices=()
+for arch in "${archs[@]}"; do
+    printf '%s\n' "Compiling ${app_name} v${VERSION} (Build ${BUILD_NUMBER}) for ${arch} (${#sources[@]} source files)..."
+    swiftc -sdk "$sdk_path" \
+        -target "${arch}-apple-macos${MIN_MACOS_VERSION}" \
+        -O \
+        -whole-module-optimization \
+        -Xlinker -dead_strip \
+        "${sources[@]}" \
+        -o "${obj_dir}/${app_name}-${arch}"
+    slices+=("${obj_dir}/${app_name}-${arch}")
+done
+
+executable="${macos_dir}/${app_name}"
+rm -f "$executable"
+lipo -create "${slices[@]}" -output "$executable"
+lipo "$executable" -verify_arch "${archs[@]}"
+printf '%s\n' "Architectures: $(lipo -archs "$executable")"
+rm -rf "$obj_dir"
 
 printf '%s\n' "Generating ${app_name} Info.plist..."
 cat <<EOF >"${contents_dir}/Info.plist"
@@ -101,19 +115,17 @@ cat <<EOF >"${contents_dir}/Info.plist"
 </plist>
 EOF
 
-# macOS remembers granted permissions (TCC) against the app's designated requirement.
-# Ad-hoc signing defaults to a per-build cdhash requirement, which loses permissions on
-# every rebuild, so pin the requirement to the bundle ID instead. No keychain is used.
-designated_requirement="designated => identifier \"${bundle_id}\""
-
-printf '%s\n' "Signing ${app_name} bundle (ad-hoc, ${designated_requirement})..."
-codesign --force --deep --sign - --requirements "=${designated_requirement}" "$app_dir"
-
-signed_requirement="$(codesign -d -r- "$app_dir" 2>&1 | grep '^designated => ' || true)"
-if [[ "$signed_requirement" != "$designated_requirement" ]]; then
-    printf '%s\n' "Error: Unexpected designated requirement '${signed_requirement}'; permissions would not persist." >&2
-    exit 1
+# SpotPen needs no privacy (TCC) permissions, so the default designated requirement is used.
+# Never pin it to the bundle identifier alone: anyone can ad-hoc sign code with that identifier
+# and would inherit any permission granted to the app.
+if [[ -n "${SIGN_IDENTITY:-}" ]]; then
+    printf '%s\n' "Signing ${app_name} bundle with '${SIGN_IDENTITY}' (hardened runtime)..."
+    codesign --force --options runtime --timestamp --sign "$SIGN_IDENTITY" "$app_dir"
+else
+    printf '%s\n' "Signing ${app_name} bundle (ad-hoc; set SIGN_IDENTITY for a Developer ID signature)..."
+    codesign --force --sign - "$app_dir"
 fi
+codesign --verify --strict "$app_dir"
 
 printf '%s\n' "Refreshing macOS LaunchServices cache..."
 touch "$app_dir"

@@ -16,7 +16,7 @@ help:
 setup:
 	@./scripts/setup.sh
 
-## build: Compile application bundle (.app), incrementing BUILD_NUMBER
+## build: Compile universal (Apple silicon + Intel) app bundle, incrementing BUILD_NUMBER
 build:
 	@./scripts/build.sh
 
@@ -72,5 +72,5 @@ revoke:
 ## clean: Remove build artifacts and temporary files
 clean:
 	@echo "==> Cleaning build artifacts..."
-	@rm -rf build .build /tmp/RunSwiftTests*
+	@rm -rf build .build
 	@echo "✅ Clean complete."

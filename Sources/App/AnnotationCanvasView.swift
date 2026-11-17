@@ -7,70 +7,114 @@ public protocol AnnotationCanvasDelegate: AnyObject {
 
 public final class AnnotationCanvasView: NSView {
     public weak var delegate: AnnotationCanvasDelegate?
-    
-    // Tools & Single Pen Color
+
+    public static let penWidthRange: ClosedRange<CGFloat> = 1.0...40.0
+    public static let spotlightRadiusRange: ClosedRange<CGFloat> = 40.0...400.0
+    private static let scrimColor = CGColor(srgbRed: 0.0, green: 0.0, blue: 0.0, alpha: 0.72)
+    private static let spotlightCursor = CursorFactory.makeSpotlightCursor()
+    /// Scroll step for a classic mouse wheel line; trackpads report precise point deltas instead.
+    private static let wheelLineInPoints: CGFloat = 10.0
+    /// Pen width / spotlight radius change per point scrolled. Both tools resize together.
+    private static let penWidthPerScrollPoint: CGFloat = 0.04
+    private static let spotlightRadiusPerScrollPoint: CGFloat = 0.25
+
+    // Tools & Single Pen Color ("hold shift for spotlight, otherwise it's a pen all the time")
     public private(set) var currentTool: AnnotationTool = .pen {
         didSet {
+            guard oldValue != currentTool else { return }
             updateCursor()
             needsDisplay = true
         }
     }
-    
+
     public let penColor: NSColor = Stroke.defaultColor
-    public var penWidth: CGFloat = 4.0
-    
+    public var penWidth: CGFloat = 4.0 {
+        didSet {
+            penWidth = min(max(penWidth, Self.penWidthRange.lowerBound), Self.penWidthRange.upperBound)
+            if penWidth != oldValue { updateCursor() }
+        }
+    }
+
     // Spotlight State (about 100px circle gradiented to transparency)
-    public var spotlightPoint: CGPoint = .zero
-    public var spotlightRadius: CGFloat = 100.0
-    private var spotlightPunchGradient: CGGradient?
-    
-    // Stroke Storage & History
+    public var spotlightPoint: CGPoint = .zero {
+        didSet { invalidateSpotlight(from: oldValue, radius: spotlightRadius) }
+    }
+    public var spotlightRadius: CGFloat = 100.0 {
+        didSet {
+            spotlightRadius = DrawingGeometry.clampRadius(
+                spotlightRadius,
+                min: Self.spotlightRadiusRange.lowerBound,
+                max: Self.spotlightRadiusRange.upperBound
+            )
+            invalidateSpotlight(from: spotlightPoint, radius: oldValue)
+        }
+    }
+    private var spotlightPunchGradient: CGGradient? = DrawingGeometry.createSpotlightPunchGradient()
+
+    // Stroke Storage (no history: Esc wipes everything)
     public private(set) var strokes: [Stroke] = []
-    public private(set) var undoStack: [[Stroke]] = []
     private var currentStrokePoints: [CGPoint] = []
-    
+    private var renderCache: StrokeRenderCache?
+
     // Tracking Area & Cursors
     private var trackingArea: NSTrackingArea?
     private var penCursor: NSCursor?
-    private var spotlightCursor: NSCursor?
-    
-    // Continuous Modifier Monitoring
-    private var modifierCheckTimer: Timer?
-    private var globalEventMonitor: Any?
-    private var localEventMonitor: Any?
-    
+    private var penCursorKey: CGFloat = -1
+
     public override var acceptsFirstResponder: Bool {
         return true
     }
-    
+
     public override init(frame frameRect: NSRect) {
         super.init(frame: frameRect)
         setup()
     }
-    
+
     required init?(coder: NSCoder) {
         super.init(coder: coder)
         setup()
     }
-    
-    deinit {
-        stopMonitoringModifiers()
-    }
-    
+
     private func setup() {
         wantsLayer = true
         layerContentsRedrawPolicy = .onSetNeedsDisplay
         layer?.backgroundColor = NSColor.clear.cgColor
-        spotlightPunchGradient = DrawingGeometry.createSpotlightPunchGradient()
-        updateCursor()
     }
-    
+
+    // MARK: - State
+
+    // MARK: - State
+
+    /// Frees the committed-stroke bitmap (tens of MB on Retina displays) while the overlay is hidden.
+    /// It is rebuilt from `strokes` on the next draw.
+    public func releaseRenderCache() {
+        renderCache = nil
+    }
+
+    private func invalidateRenderCache() {
+        renderCache = nil
+        needsDisplay = true
+    }
+
+    public override func setFrameSize(_ newSize: NSSize) {
+        let changed = newSize != frame.size
+        super.setFrameSize(newSize)
+        if changed { invalidateRenderCache() }
+    }
+
+    public override func viewDidChangeBackingProperties() {
+        super.viewDidChangeBackingProperties()
+        invalidateRenderCache()
+    }
+
+    // MARK: - Cursor
+
     public override func updateTrackingAreas() {
         super.updateTrackingAreas()
         if let existing = trackingArea {
             removeTrackingArea(existing)
         }
-        
+
         let options: NSTrackingArea.Options = [
             .activeAlways,
             .mouseMoved,
@@ -81,196 +125,153 @@ public final class AnnotationCanvasView: NSView {
         addTrackingArea(newArea)
         trackingArea = newArea
     }
-    
-    public func updateCursor() {
-        penCursor = CursorFactory.makePenCursor(penWidth: penWidth, color: penColor)
-        spotlightCursor = CursorFactory.makeSpotlightCursor(radius: spotlightRadius)
-        
-        window?.invalidateCursorRects(for: self)
-        
-        if let currentWindow = window {
-            let mouseLoc = currentWindow.mouseLocationOutsideOfEventStream
-            let viewPoint = convert(mouseLoc, from: nil)
-            if bounds.contains(viewPoint) {
-                let cursor = (currentTool == .pen) ? (penCursor ?? NSCursor.arrow) : (spotlightCursor ?? NSCursor.crosshair)
-                cursor.set()
+
+    /// Cursor for the active tool. The pen cursor is re-rendered only when the pen width moves
+    /// by at least half a point; the spotlight cursor is built once.
+    var activeCursor: NSCursor {
+        switch currentTool {
+        case .spotlight:
+            return Self.spotlightCursor
+        case .pen:
+            let key = (penWidth * 2.0).rounded() / 2.0
+            if let cursor = penCursor, key == penCursorKey {
+                return cursor
             }
+            let cursor = CursorFactory.makePenCursor(penWidth: key, color: penColor)
+            penCursor = cursor
+            penCursorKey = key
+            return cursor
         }
     }
-    
+
+    public func updateCursor() {
+        guard let currentWindow = window else { return }
+        currentWindow.invalidateCursorRects(for: self)
+        let viewPoint = convert(currentWindow.mouseLocationOutsideOfEventStream, from: nil)
+        if bounds.contains(viewPoint) {
+            activeCursor.set()
+        }
+    }
+
     public override func resetCursorRects() {
         super.resetCursorRects()
-        let cursor = (currentTool == .pen) ? (penCursor ?? NSCursor.arrow) : (spotlightCursor ?? NSCursor.crosshair)
-        addCursorRect(bounds, cursor: cursor)
+        addCursorRect(bounds, cursor: activeCursor)
     }
-    
+
+    /// Only sets the cursor. cursorUpdate events carry empty modifier flags, and switching tools
+    /// itself triggers one, so reading Shift here would immediately undo every switch to spotlight.
     public override func cursorUpdate(with event: NSEvent) {
-        checkShiftModifier(event.modifierFlags)
-        let cursor = (currentTool == .pen) ? (penCursor ?? NSCursor.arrow) : (spotlightCursor ?? NSCursor.crosshair)
-        cursor.set()
+        activeCursor.set()
     }
-    
-    // MARK: - Shift Key & Modifier Tracking ("hold shift for spotlight, otherwise it's a pen all the time")
-    
-    public func startMonitoringModifiers() {
-        stopMonitoringModifiers()
-        
-        // Listen globally for modifier flags (when another app has focus)
-        globalEventMonitor = NSEvent.addGlobalMonitorForEvents(matching: [.flagsChanged]) { [weak self] event in
-            DispatchQueue.main.async {
-                self?.checkShiftModifier(event.modifierFlags)
-            }
-        }
-        
-        // Listen locally for modifier flags (when SpotPen has focus)
-        localEventMonitor = NSEvent.addLocalMonitorForEvents(matching: [.flagsChanged]) { [weak self] event in
-            self?.checkShiftModifier(event.modifierFlags)
-            return event
-        }
-        
-        // 60Hz hardware poll timer to guarantee 0-latency detection regardless of key window focus
-        let timer = Timer.scheduledTimer(withTimeInterval: 0.016, repeats: true) { [weak self] _ in
-            self?.checkShiftModifier()
-        }
-        RunLoop.main.add(timer, forMode: .common)
-        modifierCheckTimer = timer
-        
+
+    // MARK: - Shift Key Tracking
+    //
+    // Shift state comes from the events the overlay already receives: flagsChanged while it is key,
+    // and the modifier flags carried by every mouse event. No polling, global event monitors,
+    // or Accessibility/Input Monitoring permission are needed.
+
+    /// Syncs tool, spotlight position, and cursor with the live keyboard/mouse state; call when the overlay appears.
+    public func prepareForPresentation() {
         updateSpotlightPointToCurrentMouse()
         checkShiftModifier()
+        updateCursor()
+        needsDisplay = true
     }
-    
-    public func stopMonitoringModifiers() {
-        if let global = globalEventMonitor {
-            NSEvent.removeMonitor(global)
-            globalEventMonitor = nil
-        }
-        if let local = localEventMonitor {
-            NSEvent.removeMonitor(local)
-            localEventMonitor = nil
-        }
-        modifierCheckTimer?.invalidate()
-        modifierCheckTimer = nil
-    }
-    
+
     public override func flagsChanged(with event: NSEvent) {
         super.flagsChanged(with: event)
         checkShiftModifier(event.modifierFlags)
     }
-    
-    public func isShiftDownNow(explicitFlags: NSEvent.ModifierFlags? = nil) -> Bool {
-        if let flags = explicitFlags, flags.contains(.shift) {
-            return true
-        }
-        if NSEvent.modifierFlags.contains(.shift) {
-            return true
-        }
-        if CGEventSource.flagsState(.hidSystemState).contains(.maskShift) {
-            return true
-        }
-        if CGEventSource.flagsState(.combinedSessionState).contains(.maskShift) {
-            return true
-        }
-        if CGEventSource.keyState(.hidSystemState, key: 56) || CGEventSource.keyState(.hidSystemState, key: 60) {
-            return true
-        }
-        if CGEventSource.keyState(.combinedSessionState, key: 56) || CGEventSource.keyState(.combinedSessionState, key: 60) {
-            return true
-        }
-        return false
-    }
-    
-    public func checkShiftModifier(_ explicitFlags: NSEvent.ModifierFlags? = nil) {
-        let isShiftDown = isShiftDownNow(explicitFlags: explicitFlags)
+
+    /// Switches between pen and spotlight. Uses `flags` when given, otherwise the current modifier state.
+    public func checkShiftModifier(_ flags: NSEvent.ModifierFlags? = nil) {
+        let isShiftDown = (flags ?? NSEvent.modifierFlags).contains(.shift)
         let targetTool: AnnotationTool = isShiftDown ? .spotlight : .pen
-        
-        if targetTool != currentTool {
-            if currentTool == .pen && !currentStrokePoints.isEmpty {
-                commitCurrentStroke()
-            }
-            currentTool = targetTool
-            updateSpotlightPointToCurrentMouse()
-            updateCursor()
-            needsDisplay = true
-        } else if currentTool == .spotlight {
+        guard targetTool != currentTool else { return }
+
+        if currentTool == .pen {
+            commitCurrentStroke()
+        }
+        if targetTool == .spotlight {
             updateSpotlightPointToCurrentMouse()
         }
+        currentTool = targetTool
     }
-    
+
     private func updateSpotlightPointToCurrentMouse() {
         guard let win = window else { return }
-        let screenMouse = NSEvent.mouseLocation
-        let winLoc = win.convertPoint(fromScreen: screenMouse)
-        let viewPoint = convert(winLoc, from: nil)
-        if viewPoint != spotlightPoint {
-            spotlightPoint = viewPoint
-            if currentTool == .spotlight {
-                needsDisplay = true
-            }
-        }
+        let winLoc = win.convertPoint(fromScreen: NSEvent.mouseLocation)
+        spotlightPoint = convert(winLoc, from: nil)
     }
-    
+
+    private func invalidateSpotlight(from oldPoint: CGPoint, radius oldRadius: CGFloat) {
+        guard currentTool == .spotlight,
+              oldPoint != spotlightPoint || oldRadius != spotlightRadius else { return }
+        setNeedsDisplay(DrawingGeometry.spotlightRect(center: oldPoint, radius: oldRadius))
+        setNeedsDisplay(DrawingGeometry.spotlightRect(center: spotlightPoint, radius: spotlightRadius))
+    }
+
     // MARK: - Drawing Engine
+
+    /// Test hook: forces the cache scale when the view is rendered outside a window.
+    var backingScaleOverride: CGFloat?
     
-    public override func draw(_ dirtyRect: NSRect) {
-        super.draw(dirtyRect)
-        guard let ctx = NSGraphicsContext.current?.cgContext else { return }
-        
-        // 1. Clear entire bounds to guarantee transparent background and erase previous spotlight frames
-        ctx.clear(bounds)
-        
-        // 2. Draw Spotlight (entire screen darkened, with about 100px circle gradiented to transparency)
-        if currentTool == .spotlight {
-            drawSpotlight(in: ctx)
-        }
-        
-        // 3. Draw Committed Strokes (drawn on top of the spotlight scrim)
-        ctx.saveGState()
-        ctx.setLineCap(.round)
-        ctx.setLineJoin(.round)
-        
-        // Slight shadow under pen strokes for natural elevation and depth
-        ctx.setShadow(
-            offset: Stroke.shadowOffset,
-            blur: Stroke.shadowBlur,
-            color: Stroke.shadowColor
-        )
-        
-        for stroke in strokes {
-            guard !stroke.points.isEmpty else { continue }
-            ctx.setStrokeColor(stroke.color.cgColor)
-            ctx.setLineWidth(stroke.lineWidth)
-            
-            let path = DrawingGeometry.buildSmoothPath(from: stroke.points)
-            ctx.addPath(path)
-            ctx.strokePath()
-        }
-        
-        // 4. Draw Active In-Progress Stroke (with the same shadow)
-        if currentTool == .pen && !currentStrokePoints.isEmpty {
-            ctx.setStrokeColor(penColor.cgColor)
-            ctx.setLineWidth(penWidth)
-            
-            let activePath = DrawingGeometry.buildSmoothPath(from: currentStrokePoints)
-            ctx.addPath(activePath)
-            ctx.strokePath()
-        }
-        
-        ctx.restoreGState()
+    private var backingScale: CGFloat {
+        return backingScaleOverride ?? window?.backingScaleFactor ?? NSScreen.main?.backingScaleFactor ?? 1.0
     }
-    
-    private func drawSpotlight(in ctx: CGContext) {
-        ctx.saveGState()
-        
-        // 1. Overlay entire screen with darker scrim color
-        ctx.setBlendMode(.normal)
-        ctx.setFillColor(CGColor(srgbRed: 0.0, green: 0.0, blue: 0.0, alpha: 0.72))
-        ctx.fill(bounds)
-        
-        // 2. Punch about 100px circular aperture gradiented to transparency at the cursor
-        if spotlightPunchGradient == nil {
-            spotlightPunchGradient = DrawingGeometry.createSpotlightPunchGradient()
+
+    private var cacheColorSpace: CGColorSpace {
+        if let space = window?.colorSpace?.cgColorSpace, space.model == .rgb {
+            return space
         }
-        
+        return CGColorSpace(name: CGColorSpace.sRGB) ?? CGColorSpaceCreateDeviceRGB()
+    }
+
+    /// Image of all committed strokes, rebuilding the cache if it is missing or stale.
+    func committedStrokesImage() -> (CGImage, CGRect)? {
+        guard !strokes.isEmpty else { return nil }
+        let scale = backingScale
+        if renderCache?.matches(pointSize: bounds.size, scale: scale) != true {
+            renderCache = StrokeRenderCache(pointSize: bounds.size, scale: scale, colorSpace: cacheColorSpace)
+            strokes.forEach { renderCache?.draw($0) }
+        }
+        guard let cache = renderCache, let image = cache.image() else { return nil }
+        return (image, cache.drawRect)
+    }
+
+    /// Draws only `dirtyRect`. AppKit clips the context to the invalidated regions, so a pen drag
+    /// or spotlight move costs roughly the size of the changed area, not the whole screen.
+    public override func draw(_ dirtyRect: NSRect) {
+        guard let ctx = NSGraphicsContext.current?.cgContext else { return }
+
+        // 1. Clear to guarantee a transparent background and erase the previous spotlight frame.
+        ctx.clear(dirtyRect)
+
+        // 2. Spotlight scrim with a gradient aperture at the cursor.
+        if currentTool == .spotlight {
+            drawSpotlight(in: ctx, rect: dirtyRect)
+        }
+
+        // 3. Committed strokes (on top of the spotlight scrim), blitted from the cache.
+        if let (image, rect) = committedStrokesImage() {
+            ctx.draw(image, in: rect)
+        }
+
+        // 4. In-progress stroke, with the same shadow.
+        if currentTool == .pen && !currentStrokePoints.isEmpty {
+            StrokeRenderer.stroke(points: currentStrokePoints, color: penColor.cgColor, lineWidth: penWidth, in: ctx, shadowScale: 1.0)
+        }
+    }
+
+    private func drawSpotlight(in ctx: CGContext, rect: CGRect) {
+        ctx.saveGState()
+
+        // 1. Darken with the scrim.
+        ctx.setBlendMode(.normal)
+        ctx.setFillColor(Self.scrimColor)
+        ctx.fill(rect)
+
+        // 2. Punch the circular aperture, gradiented to transparency.
         if let gradient = spotlightPunchGradient {
             ctx.setBlendMode(.destinationOut)
             ctx.drawRadialGradient(
@@ -282,171 +283,125 @@ public final class AnnotationCanvasView: NSView {
                 options: []
             )
         }
-        
+
         ctx.restoreGState()
     }
-    
+
     // MARK: - Mouse Event Handling
-    
+
     public override func mouseMoved(with event: NSEvent) {
         checkShiftModifier(event.modifierFlags)
-        let point = convert(event.locationInWindow, from: nil)
-        
         if currentTool == .spotlight {
-            spotlightPoint = point
-            needsDisplay = true
+            spotlightPoint = convert(event.locationInWindow, from: nil)
         }
     }
-    
+
     public override func mouseDown(with event: NSEvent) {
         checkShiftModifier(event.modifierFlags)
         let point = convert(event.locationInWindow, from: nil)
-        
+
         switch currentTool {
         case .pen:
             currentStrokePoints = [point]
-            needsDisplay = true
-            
+            invalidateActiveStrokeTail()
         case .spotlight:
             spotlightPoint = point
-            needsDisplay = true
         }
     }
-    
+
     public override func mouseDragged(with event: NSEvent) {
         checkShiftModifier(event.modifierFlags)
         let point = convert(event.locationInWindow, from: nil)
-        
+
         switch currentTool {
         case .pen:
+            guard point != currentStrokePoints.last else { return }
             currentStrokePoints.append(point)
-            needsDisplay = true
-            
+            invalidateActiveStrokeTail()
         case .spotlight:
             spotlightPoint = point
-            needsDisplay = true
         }
     }
-    
+
     public override func mouseUp(with event: NSEvent) {
-        switch currentTool {
-        case .pen:
+        if currentTool == .pen {
             commitCurrentStroke()
-            
-        case .spotlight:
-            break
         }
     }
-    
+
+    /// Appending a point only changes the path between the last three points
+    /// (the previous end segment becomes a curve plus a new end segment).
+    private func invalidateActiveStrokeTail() {
+        let rect = DrawingGeometry.inkRect(of: currentStrokePoints.suffix(3), lineWidth: penWidth)
+        if !rect.isNull { setNeedsDisplay(rect) }
+    }
+
     private func commitCurrentStroke() {
         guard !currentStrokePoints.isEmpty else { return }
-        undoStack.append(strokes)
         let completedStroke = Stroke(
             points: currentStrokePoints,
             color: penColor,
             lineWidth: penWidth
         )
-        strokes.append(completedStroke)
         currentStrokePoints = []
-        needsDisplay = true
+        strokes.append(completedStroke)
+        renderCache?.draw(completedStroke)
+        let rect = completedStroke.inkRect
+        if !rect.isNull { setNeedsDisplay(rect) }
     }
-    
-    // MARK: - Independent Size Adjustment
-    
+
+    // MARK: - Size Adjustment (pen and spotlight resize together)
+
+    /// Grows (positive) or shrinks (negative) both the pen and the spotlight by `points` of scroll.
+    public func adjustSize(byScrollPoints points: CGFloat) {
+        penWidth += points * Self.penWidthPerScrollPoint
+        spotlightRadius += points * Self.spotlightRadiusPerScrollPoint
+    }
+
     public override func scrollWheel(with event: NSEvent) {
-        let isSpotlight = (currentTool == .spotlight) || isShiftDownNow(explicitFlags: event.modifierFlags)
-        let rawDelta = (event.deltaY != 0) ? event.deltaY : event.scrollingDeltaY
-        // Invert delta so scroll up enlarges size, scroll down shrinks size
-        let delta = -rawDelta
-        
-        if isSpotlight {
-            // Strictly independent: only changes spotlight size
-            spotlightRadius = DrawingGeometry.clampRadius(spotlightRadius + delta * 2.5, min: 40.0, max: 400.0)
-            updateCursor()
-            needsDisplay = true
-        } else {
-            // Strictly independent: only changes pen size
-            penWidth = min(max(penWidth + delta * 0.4, 1.0), 40.0)
-            updateCursor()
-            needsDisplay = true
-        }
+        // Shift+wheel on a mouse arrives as horizontal scroll, so fall back to the X axis.
+        let dy = event.scrollingDeltaY
+        let raw = (dy != 0) ? dy : event.scrollingDeltaX
+        guard raw != 0 else { return }
+        let points = event.hasPreciseScrollingDeltas ? raw : raw * Self.wheelLineInPoints
+        // Undo the natural-scrolling inversion so pushing the wheel / fingers away always enlarges.
+        adjustSize(byScrollPoints: event.isDirectionInvertedFromDevice ? -points : points)
     }
-    
+
     // MARK: - Canvas Actions
-    
+
+    /// Wipes every stroke, including one in progress.
     public func clearAll() {
         guard !strokes.isEmpty || !currentStrokePoints.isEmpty else { return }
-        undoStack.append(strokes)
-        strokes.removeAll()
-        currentStrokePoints.removeAll()
-        needsDisplay = true
+        strokes = []
+        currentStrokePoints = []
+        invalidateRenderCache()
     }
-    
-    public func undoLastStroke() {
-        guard let previousState = undoStack.popLast() else {
-            if !strokes.isEmpty {
-                strokes.removeLast()
-                needsDisplay = true
-            }
-            return
-        }
-        strokes = previousState
-        currentStrokePoints.removeAll()
-        needsDisplay = true
-    }
-    
+
     // MARK: - Keyboard Event Handling
-    
+
     public override func keyDown(with event: NSEvent) {
-        // Esc (53): Close overlay
+        // Esc (53): clear everything and close the overlay.
         if event.keyCode == 53 {
+            clearAll()
             delegate?.canvasDidRequestClose()
             return
         }
-        
-        // Key to clear screen: 'C' / 'c' (keyCode 8) or Backspace/Delete (keyCode 51 / 117)
-        if event.keyCode == 8 || event.keyCode == 51 || event.keyCode == 117 {
+
+        // C (8): clear the screen and keep drawing. Ignored with ⌘/⌃/⌥ so shortcuts aren't swallowed.
+        if event.keyCode == 8, event.modifierFlags.intersection([.command, .control, .option]).isEmpty {
             clearAll()
             return
         }
-        
-        // Cmd+Z: Undo
-        if event.modifierFlags.contains(.command),
-           let chars = event.charactersIgnoringModifiers,
-           chars.lowercased() == "z" {
-            undoLastStroke()
+
+        // '[' / ']': resize pen and spotlight together.
+        // charactersIgnoringModifiers keeps Shift, so Shift+[ arrives as "{" on most layouts.
+        if let chars = event.charactersIgnoringModifiers, ["[", "]", "{", "}"].contains(chars) {
+            let direction: CGFloat = (chars == "]" || chars == "}") ? 1.0 : -1.0
+            adjustSize(byScrollPoints: 40.0 * direction)
             return
         }
-        
-        // '[' / ']': Independent size adjust
-        if let chars = event.charactersIgnoringModifiers {
-            let isSpotlight = (currentTool == .spotlight) || isShiftDownNow(explicitFlags: event.modifierFlags)
-            
-            if chars == "[" {
-                if isSpotlight {
-                    // Strictly independent: only changes spotlight size
-                    spotlightRadius = DrawingGeometry.clampRadius(spotlightRadius - 15.0, min: 40.0, max: 400.0)
-                } else {
-                    // Strictly independent: only changes pen size
-                    penWidth = max(penWidth - 1.5, 1.0)
-                }
-                updateCursor()
-                needsDisplay = true
-                return
-            } else if chars == "]" {
-                if isSpotlight {
-                    // Strictly independent: only changes spotlight size
-                    spotlightRadius = DrawingGeometry.clampRadius(spotlightRadius + 15.0, min: 40.0, max: 400.0)
-                } else {
-                    // Strictly independent: only changes pen size
-                    penWidth = min(penWidth + 1.5, 40.0)
-                }
-                updateCursor()
-                needsDisplay = true
-                return
-            }
-        }
-        
+
         super.keyDown(with: event)
     }
 }

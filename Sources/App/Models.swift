@@ -23,6 +23,11 @@ public struct Stroke: Equatable {
         self.lineWidth = lineWidth
     }
     
+    /// Area this stroke paints, including round caps and shadow.
+    public var inkRect: CGRect {
+        return DrawingGeometry.inkRect(of: points, lineWidth: lineWidth)
+    }
+    
     // Only one single pen color across the application (10% transparent -> 0.90 alpha)
     public static let defaultColor = NSColor(red: 1.0, green: 0.22, blue: 0.28, alpha: 0.90)
     

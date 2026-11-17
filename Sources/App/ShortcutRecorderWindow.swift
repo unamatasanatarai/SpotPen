@@ -1,14 +1,17 @@
 import AppKit
 
 public final class ShortcutRecordContentView: NSView {
-    public var onRecorded: ((SavedHotKey) -> Void)?
+    /// Applies the recorded shortcut; returns the error to show if it could not be registered.
+    public var onRecorded: ((SavedHotKey) -> Result<Void, ShortcutError>)?
+    /// Called once the success confirmation has been shown.
+    public var onFinished: (() -> Void)?
     public var onCancel: (() -> Void)?
     
-    private let titleLabel = NSTextField(labelWithString: "Change Toggle Shortcut")
+    private let titleLabel = NSTextField(labelWithString: "Change Activation Shortcut")
     private let promptLabel = NSTextField(labelWithString: "Press desired shortcut combination...")
     private let shortcutBox = NSBox()
     private let shortcutLabel = NSTextField(labelWithString: "Type shortcut...")
-    private let tipLabel = NSTextField(labelWithString: "Requires ⌘, ⌥, ⌃, or ⇧ (Esc to cancel)")
+    private let tipLabel = NSTextField(labelWithString: "Requires ⌘ or ⌃, or an F-key (Esc to cancel)")
     
     public override var acceptsFirstResponder: Bool {
         return true
@@ -91,24 +94,33 @@ public final class ShortcutRecordContentView: NSView {
             return
         }
         
-        if let newHotKey = SavedHotKey.from(event: event) {
+        switch SavedHotKey.parse(event: event) {
+        case .success(let newHotKey):
             shortcutLabel.stringValue = newHotKey.displayString
+            if case .failure(let error) = onRecorded?(newHotKey) ?? .success(()) {
+                showError(error)
+                return
+            }
             shortcutBox.borderColor = NSColor.systemGreen
             promptLabel.stringValue = "Saved!"
-            
             DispatchQueue.main.asyncAfter(deadline: .now() + 0.2) { [weak self] in
-                self?.onRecorded?(newHotKey)
+                self?.onFinished?()
             }
-        } else {
-            promptLabel.stringValue = "Must include at least one modifier key (⌘, ⌥, ⌃, ⇧)"
-            NSSound.beep()
+        case .failure(let error):
+            showError(error)
         }
+    }
+    
+    private func showError(_ error: ShortcutError) {
+        shortcutBox.borderColor = NSColor.systemRed
+        promptLabel.stringValue = error.message
+        NSSound.beep()
     }
 }
 
 public final class ShortcutRecorderWindow: NSPanel {
     public static let shared = ShortcutRecorderWindow()
-    public var onHotKeyRecorded: ((SavedHotKey) -> Void)?
+    public var onHotKeyRecorded: ((SavedHotKey) -> Result<Void, ShortcutError>)?
     
     private var recordView: ShortcutRecordContentView!
     
@@ -126,7 +138,9 @@ public final class ShortcutRecorderWindow: NSPanel {
         
         recordView = ShortcutRecordContentView(frame: NSRect(x: 0, y: 0, width: 320, height: 160))
         recordView.onRecorded = { [weak self] hotKey in
-            self?.onHotKeyRecorded?(hotKey)
+            return self?.onHotKeyRecorded?(hotKey) ?? .success(())
+        }
+        recordView.onFinished = { [weak self] in
             self?.orderOut(nil)
         }
         recordView.onCancel = { [weak self] in

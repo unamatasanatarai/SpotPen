@@ -9,6 +9,7 @@ export BUNDLE_ID="${BUNDLE_ID:-com.SpotPen.app}"
 export MIN_MACOS_VERSION="${MIN_MACOS_VERSION:-12.0}"
 export COPYRIGHT="${COPYRIGHT:-Copyright © $(date +%Y). All rights reserved.}"
 export LS_UI_ELEMENT="${LS_UI_ELEMENT:-true}" # Set to "true" for menu-bar-only / agent apps
+export ARCHS="${ARCHS:-arm64 x86_64}"        # Architectures in the universal binary (Apple silicon + Intel)
 
 project_root="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 

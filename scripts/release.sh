@@ -69,6 +69,8 @@ Required environment:
 Optional environment:
   GEMINI_MODEL        Gemini model ID.
                       Default: gemini-3.8-flash
+  SIGN_IDENTITY       Developer ID identity used to sign the app and DMG.
+  NOTARY_PROFILE      notarytool keychain profile; notarizes and staples the DMG.
 
 Dependencies:
   bash, git, curl, jq
@@ -187,7 +189,10 @@ else
 fi
 
 # Reverse chronological traversal so summaries read oldest to newest.
-readarray -t commit_list < <(git rev-list --reverse "$commit_range")
+commit_list=()
+while IFS= read -r commit; do
+    commit_list+=("$commit")
+done < <(git rev-list --reverse "$commit_range")
 
 ((${#commit_list[@]} > 0)) ||
     die "No commits found since the previous version tag."
@@ -293,6 +298,10 @@ jq -n --rawfile prompt "$prompt_file" '{
 
 info "Generating release summary via Gemini (${GEMINI_MODEL})..."
 
+# Pass the API key through a private file, not curl's arguments, so it never shows up in `ps`.
+header_file="${tmp_dir}/gemini-headers.txt"
+(umask 077 && printf 'x-goog-api-key: %s\n' "$GEMINI_API_KEY" >"$header_file")
+
 if ! curl \
     --silent \
     --show-error \
@@ -300,10 +309,11 @@ if ! curl \
     --connect-timeout 15 \
     --max-time 180 \
     -X POST "$GEMINI_API_URL" \
-    -H "x-goog-api-key: ${GEMINI_API_KEY}" \
+    -H "@${header_file}" \
     -H 'Content-Type: application/json' \
     --data-binary "@${request_file}" \
     -o "$response_file"; then
+    rm -f "$header_file"
 
     printf 'Gemini API request failed.\n' >&2
     jq -r '.error.message // empty' "$response_file" >&2 2>/dev/null || true
@@ -317,6 +327,8 @@ if ! jq -e '.candidates[0].content.parts' \
         "$response_file" >&2 2>/dev/null || true
     die "Summarization failed; release aborted."
 fi
+
+rm -f "$header_file"
 
 finish_reason="$(jq -r '.candidates[0].finishReason // empty' "$response_file")"
 [[ "$finish_reason" != "MAX_TOKENS" ]] ||
@@ -392,7 +404,7 @@ printf '  3. Commit VERSION and BUILD_NUMBER: "%s"\n' "$release_commit_message"
 printf '  4. Create annotated tag v%s\n' "$version"
 printf '  5. Push branch %s and tag v%s to origin\n' "$current_branch" "$version"
 if [[ "$publish_github" == true ]]; then
-    printf '  6. Create GitHub release v%s with %s\n' "$version" "$dmg_name"
+    printf '  6. Create GitHub release v%s with %s and its SHA-256 checksum\n' "$version" "$dmg_name"
 else
     printf '  6. Skip GitHub release (GitHub CLI gh is not installed)\n'
 fi
@@ -423,6 +435,13 @@ built_version="$(/usr/libexec/PlistBuddy -c "Print :CFBundleShortVersionString" 
 [[ "$built_version" == "$version" ]] ||
     die "Built app reports version ${built_version}, expected ${version}."
 
+# Publish a checksum so downloads can be verified.
+checksum_file="${build_dir}/${dmg_name}.sha256"
+(cd "$build_dir" && shasum -a 256 "$dmg_name") >"$checksum_file"
+dmg_sha256="$(cut -d ' ' -f 1 "$checksum_file")"
+printf '\n### Verify the download\n\n```\nshasum -a 256 %s\n%s\n```\n' "$dmg_name" "$dmg_sha256" >>"$release_notes_file"
+info "SHA-256 ${dmg_name}: ${dmg_sha256}"
+
 # Commit the version together with the build number that was shipped.
 git add -- VERSION BUILD_NUMBER
 git commit -m "$release_commit_message"
@@ -444,7 +463,7 @@ git push origin "v${version}"
 if [[ "$publish_github" == true ]]; then
     info "Publishing GitHub release v${version}..."
 
-    gh release create "v${version}" "$dmg_path" \
+    gh release create "v${version}" "$dmg_path" "$checksum_file" \
         --title "${APP_NAME} v${version}" \
         --notes-file "$release_notes_file"
 else

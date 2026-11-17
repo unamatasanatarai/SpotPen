@@ -8,8 +8,8 @@ cd "$project_dir"
 
 source "${script_dir}/config.sh"
 
-cache_dir="${XDG_CACHE_HOME:-$HOME/.cache}/${APP_NAME,,}"
-mkdir -p "$cache_dir"
+work_dir="$(mktemp -d "${TMPDIR:-/tmp}/spotpen-dmg.XXXXXX")"
+trap 'rm -rf "$work_dir"' EXIT
 
 build_dir="build"
 app_bundle="${build_dir}/${APP_NAME}.app"
@@ -35,17 +35,17 @@ if [[ ! -f "$dmg_icon" ]]; then
     dmg_icon="$app_icon"
 fi
 
-# Detach any existing mounted volumes with this name
-hdi_info_file="${cache_dir}/hdiutil_info.tmp"
-hdiutil info >"$hdi_info_file" 2>/dev/null || true
-if [[ -f "$hdi_info_file" ]]; then
-    while IFS= read -r line; do
-        if [[ "$line" =~ (/Volumes/${APP_NAME}( [0-9]+)?)[[:space:]]*$ ]]; then
-            hdiutil detach "${BASH_REMATCH[1]}" -force >/dev/null 2>&1 || true
-        fi
-    done <"$hdi_info_file"
-    rm -f "$hdi_info_file"
-fi
+# Detach a leftover mount of *our* scratch image from an interrupted run. Volumes that
+# merely share the app's name (e.g. a user's own "SpotPen" disk) are left alone.
+tmp_dmg_abs="${project_dir}/${tmp_dmg}"
+image_path=""
+while IFS= read -r line; do
+    if [[ "$line" =~ ^image-path[[:space:]]*:[[:space:]]*(.*)$ ]]; then
+        image_path="${BASH_REMATCH[1]}"
+    elif [[ "$image_path" == "$tmp_dmg_abs" && "$line" =~ (/Volumes/.*)$ ]]; then
+        hdiutil detach "${BASH_REMATCH[1]}" -force >/dev/null 2>&1 || true
+    fi
+done < <(hdiutil info 2>/dev/null || true)
 
 printf '%s\n' "Creating styled DMG package for ${APP_NAME} v${VERSION}..."
 rm -rf "${build_dir}/dmg_root" "$tmp_dmg" "$dmg_path"
@@ -67,17 +67,20 @@ cp "$dmg_icon" "${build_dir}/dmg_root/.VolumeIcon.icns"
 
 hdiutil create -volname "${APP_NAME}" -srcfolder "${build_dir}/dmg_root" -fs HFS+ -format UDRW -ov "$tmp_dmg" >/dev/null
 
-attach_file="${cache_dir}/hdiutil_attach.tmp"
+attach_file="${work_dir}/hdiutil_attach.txt"
 hdiutil attach -readwrite -noverify -noautoopen "$tmp_dmg" >"$attach_file" 2>/dev/null
 
+# The attach output only lists this image. Its volume may be "SpotPen 1" if another
+# "SpotPen" volume is already mounted, so use the real mount point and name.
 mount_point=""
 while IFS= read -r line; do
-    if [[ "$line" =~ (/Volumes/${APP_NAME}( [0-9]+)?)[[:space:]]*$ ]]; then
+    if [[ "$line" =~ (/Volumes/.+)$ ]]; then
         mount_point="${BASH_REMATCH[1]}"
+        mount_point="${mount_point%"${mount_point##*[![:space:]]}"}"
         break
     fi
 done <"$attach_file"
-rm -f "$attach_file"
+volume_name="${mount_point##*/}"
 
 if [[ -z "$mount_point" || ! -d "$mount_point" ]]; then
     printf '%s\n' "Error: Failed to identify disk image mount point" >&2
@@ -86,7 +89,7 @@ fi
 
 osascript <<APPLESCRIPT >/dev/null 2>&1 || true
 tell application "Finder"
-    tell disk "${APP_NAME}"
+    tell disk "${volume_name}"
         open
         set current view of container window to icon view
         set toolbar visible of container window to false
@@ -131,5 +134,23 @@ function run(argv) {
     return $.NSWorkspace.sharedWorkspace.setIconForFileOptions(icon, argv[1], 0);
 }
 JXA
+
+# Optional distribution signing and notarization (requires an Apple Developer account):
+#   SIGN_IDENTITY="Developer ID Application: Name (TEAMID)"
+#   NOTARY_PROFILE=<profile stored with: xcrun notarytool store-credentials>
+if [[ -n "${SIGN_IDENTITY:-}" ]]; then
+    printf '%s\n' "Signing ${dmg_name}..."
+    codesign --force --timestamp --sign "$SIGN_IDENTITY" "$dmg_path"
+    if [[ -n "${NOTARY_PROFILE:-}" ]]; then
+        printf '%s\n' "Notarizing ${dmg_name} (this can take a few minutes)..."
+        xcrun notarytool submit "$dmg_path" --keychain-profile "$NOTARY_PROFILE" --wait
+        xcrun stapler staple "$dmg_path"
+    fi
+elif [[ -n "${NOTARY_PROFILE:-}" ]]; then
+    printf '%s\n' "Error: NOTARY_PROFILE requires SIGN_IDENTITY (Developer ID)." >&2
+    exit 1
+else
+    printf '%s\n' "Note: ${dmg_name} is ad-hoc signed and not notarized; Gatekeeper will warn on other Macs."
+fi
 
 printf '%s\n' "✅ DMG created successfully: ${dmg_path}"

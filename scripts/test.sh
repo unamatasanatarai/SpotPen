@@ -8,22 +8,31 @@ cd "$project_dir"
 
 source "${script_dir}/config.sh"
 
-cache_dir="${XDG_CACHE_HOME:-$HOME/.cache}/${APP_NAME,,}"
-mkdir -p "$cache_dir"
-
-sdk_file="${cache_dir}/sdk_path.tmp"
-xcrun --show-sdk-path >"$sdk_file" 2>/dev/null
-if [[ ! -s "$sdk_file" ]]; then
-    rm -f "$sdk_file"
+sdk_path="$(xcrun --show-sdk-path 2>/dev/null || true)"
+if [[ -z "$sdk_path" ]]; then
     printf '%s\n' "Error: Failed to locate macOS SDK via xcrun" >&2
     exit 1
 fi
-IFS= read -r sdk_path <"$sdk_file"
-rm -f "$sdk_file"
 
-test_dir="${XDG_RUNTIME_DIR:-/tmp}"
-test_bin="${test_dir}/RunSwiftTests_${RANDOM}"
-trap 'rm -f "$test_bin"' EXIT INT TERM
+# Private, unpredictable directory (macOS $TMPDIR is per-user, mode 0700) so no other
+# local user can pre-create or swap the binary between linking and running it.
+test_dir="$(mktemp -d "${TMPDIR:-/tmp}/spotpen-tests.XXXXXX")"
+# Fixed name: an unbundled binary stores AppKit state (e.g. status item positions) in a
+# preferences domain named after the executable, so a stable name avoids one file per run.
+test_name="SpotPenTests"
+test_bin="${test_dir}/${test_name}"
+
+cleanup() {
+    rm -rf "$test_dir"
+    # Drop the test-only preference domains (process domain + suites used by the tests),
+    # then the empty files cfprefsd leaves behind.
+    local domain
+    for domain in "$test_name" "${test_name}.B"; do
+        defaults delete "$domain" >/dev/null 2>&1 || true
+        rm -f "${HOME}/Library/Preferences/${domain}.plist"
+    done
+}
+trap cleanup EXIT INT TERM
 
 # Collect app sources excluding entry points with @main (e.g. Main.swift)
 sources=()
@@ -33,26 +42,25 @@ while IFS= read -r file; do
     fi
 done < <(find Sources/App -type f -name "*.swift" | sort)
 
-# Collect test sources
-tests=(
-    "Tests/AppTests/AppTests.swift"
-    "Tests/AppTests/TestMain.swift"
-)
+tests=()
+while IFS= read -r file; do
+    tests+=("$file")
+done < <(find Tests/AppTests -type f -name "*.swift" | sort)
 
 if [[ ${#tests[@]} -eq 0 ]]; then
     printf '%s\n' "Error: No test files found under Tests" >&2
     exit 1
 fi
 
-printf '%s\n' "Compiling unit test suite..."
+printf '%s\n' "Compiling unit test suite ($(uname -m))..."
 swiftc -sdk "$sdk_path" \
+    -target "$(uname -m)-apple-macos${MIN_MACOS_VERSION}" \
     "${sources[@]}" \
     "${tests[@]}" \
     -o "$test_bin"
 
 test_status=0
 "$test_bin" || test_status=$?
-rm -f "$test_bin"
 
 if [[ "$test_status" -ne 0 ]]; then
     printf '%s\n' "Error: Swift unit tests failed with status ${test_status}" >&2

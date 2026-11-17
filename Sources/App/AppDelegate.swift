@@ -7,78 +7,63 @@ public final class AppDelegate: NSObject, NSApplicationDelegate, OverlayWindowDe
 
     public func applicationDidFinishLaunching(_ notification: Notification) {
         NSApp.setActivationPolicy(.accessory)
-        
+
         overlayController = OverlayWindowController()
         overlayController.delegate = self
-        
-        statusBarController = StatusBarController()
-        statusBarController.delegate = self
-        
+
         hotKeyManager = HotKeyManager { [weak self] in
             self?.handleGlobalHotKey()
         }
-        
-        // Keep status bar synchronized with active hotkey
-        statusBarController.updateHotKey(hotKeyManager.currentHotKey)
-        
-        // Setup custom shortcut recorder callback
+
+        statusBarController = StatusBarController(
+            hotKey: hotKeyManager.currentHotKey,
+            isHotKeyActive: hotKeyManager.isRegistered
+        )
+        statusBarController.delegate = self
+
+        // Custom shortcut recorder: the recorder shows the error itself when registration fails.
         ShortcutRecorderWindow.shared.onHotKeyRecorded = { [weak self] newHotKey in
-            guard let self = self else { return }
-            self.hotKeyManager.registerHotKey(newHotKey)
-            self.statusBarController.updateHotKey(newHotKey)
+            guard let self = self else { return .success(()) }
+            return self.applyHotKey(newHotKey)
         }
-        
+
         NSLog("%@ started successfully. Press %@ or click the menu bar icon to annotate.", AppConfig.appName, hotKeyManager.currentHotKey.displayString)
     }
 
     public func applicationShouldTerminateAfterLastWindowClosed(_ sender: NSApplication) -> Bool {
         return false
     }
-    
+
     private func handleGlobalHotKey() {
         overlayController.toggle()
-        statusBarController.updateOverlayVisibility(isVisible: overlayController.isVisible)
     }
-    
+
+    /// Registers the shortcut and updates the menu only if the system accepted it.
+    private func applyHotKey(_ hotKey: SavedHotKey) -> Result<Void, ShortcutError> {
+        let result = hotKeyManager.registerHotKey(hotKey)
+        statusBarController.updateHotKey(hotKeyManager.currentHotKey, isActive: hotKeyManager.isRegistered)
+        return result
+    }
+
     // MARK: - OverlayWindowDelegate
-    
-    public func overlayWindowDidDismiss() {
-        statusBarController.updateOverlayVisibility(isVisible: false)
-    }
-    
+
+    public func overlayWindowDidDismiss() {}
+
     // MARK: - StatusBarControllerDelegate
-    
-    public func statusBarDidRequestToggle() {
+
+    public func statusBarDidRequestActivate() {
         DispatchQueue.main.async { [weak self] in
-            guard let self = self else { return }
-            self.overlayController.toggle()
-            self.statusBarController.updateOverlayVisibility(isVisible: self.overlayController.isVisible)
+            self?.overlayController.show()
         }
     }
-    
-    public func statusBarDidSelectHotKey(_ hotKey: SavedHotKey) {
-        hotKeyManager.registerHotKey(hotKey)
-    }
-    
+
     public func statusBarDidRequestRecordShortcut() {
         DispatchQueue.main.async { [weak self] in
             guard let self = self else { return }
             ShortcutRecorderWindow.shared.show(currentHotKey: self.hotKeyManager.currentHotKey)
         }
     }
-    
-    public func statusBarDidRequestClear() {
-        DispatchQueue.main.async { [weak self] in
-            self?.overlayController.canvasView.clearAll()
-        }
-    }
-    
-    public func statusBarDidRequestUndo() {
-        DispatchQueue.main.async { [weak self] in
-            self?.overlayController.canvasView.undoLastStroke()
-        }
-    }
-    
+
     public func statusBarDidRequestQuit() {
         NSApp.terminate(nil)
     }
