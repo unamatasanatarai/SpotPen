@@ -1,6 +1,6 @@
 import Cocoa
 
-public final class AppDelegate: NSObject, NSApplicationDelegate, OverlayWindowDelegate, StatusBarControllerDelegate {
+public final class AppDelegate: NSObject, NSApplicationDelegate, StatusBarControllerDelegate {
     private var overlayController: OverlayWindowController!
     private var hotKeyManager: HotKeyManager!
     private var statusBarController: StatusBarController!
@@ -9,7 +9,6 @@ public final class AppDelegate: NSObject, NSApplicationDelegate, OverlayWindowDe
         NSApp.setActivationPolicy(.accessory)
 
         overlayController = OverlayWindowController()
-        overlayController.delegate = self
 
         hotKeyManager = HotKeyManager { [weak self] in
             self?.handleGlobalHotKey()
@@ -25,6 +24,12 @@ public final class AppDelegate: NSObject, NSApplicationDelegate, OverlayWindowDe
         ShortcutRecorderWindow.shared.onHotKeyRecorded = { [weak self] newHotKey in
             guard let self = self else { return .success(()) }
             return self.applyHotKey(newHotKey)
+        }
+        // The shortcut is released while recording so pressing it reaches the recorder.
+        ShortcutRecorderWindow.shared.onDismiss = { [weak self] in
+            guard let self = self else { return }
+            self.hotKeyManager.resume()
+            self.statusBarController.updateHotKey(self.hotKeyManager.currentHotKey, isActive: self.hotKeyManager.isRegistered)
         }
 
         NSLog("%@ started successfully. Press %@ or click the menu bar icon to annotate.", AppConfig.appName, hotKeyManager.currentHotKey.displayString)
@@ -45,10 +50,6 @@ public final class AppDelegate: NSObject, NSApplicationDelegate, OverlayWindowDe
         return result
     }
 
-    // MARK: - OverlayWindowDelegate
-
-    public func overlayWindowDidDismiss() {}
-
     // MARK: - StatusBarControllerDelegate
 
     public func statusBarDidRequestActivate() {
@@ -60,6 +61,7 @@ public final class AppDelegate: NSObject, NSApplicationDelegate, OverlayWindowDe
     public func statusBarDidRequestRecordShortcut() {
         DispatchQueue.main.async { [weak self] in
             guard let self = self else { return }
+            self.hotKeyManager.suspend()
             ShortcutRecorderWindow.shared.show(currentHotKey: self.hotKeyManager.currentHotKey)
         }
     }

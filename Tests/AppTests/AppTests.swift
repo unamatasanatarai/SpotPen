@@ -175,7 +175,6 @@ public enum AppTests {
                 try expect(result.failureValue == .needsCommandOrControl, "\(name) must be rejected")
             }
             try expect(SavedHotKey.parse(event: key(kVK_LeftArrow, "", flags: [.command])).failureValue == .unsupportedKey, "Unknown keys are rejected")
-            try expect(SavedHotKey.presets.allSatisfy(\.isAllowedAsGlobalShortcut), "Every preset must be allowed")
         }
 
         testRunner("SavedHotKey.load ignores saved shortcuts that are no longer allowed") {
@@ -361,6 +360,70 @@ public enum AppTests {
             try expect(canvas.currentTool == .spotlight, "Mouse events carry Shift state too")
             canvas.mouseMoved(with: mouse(.mouseMoved, NSPoint(x: 10, y: 10)))
             try expect(canvas.currentTool == .pen, "Releasing Shift is seen on the next mouse event")
+        }
+
+        testRunner("C clears by the typed letter, not the key position (non-US layouts)") {
+            let canvas = AnnotationCanvasView(frame: NSRect(x: 0, y: 0, width: 400, height: 300))
+            drawStroke(on: canvas, from: NSPoint(x: 10, y: 10), to: NSPoint(x: 60, y: 60))
+            canvas.keyDown(with: key(kVK_ANSI_C, "j", flags: [])) // Dvorak: the US "C" position types J
+            try expect(canvas.strokes.count == 1, "The key typing J must not clear")
+            canvas.keyDown(with: key(kVK_ANSI_I, "c", flags: [])) // Dvorak: C lives on the US "I" position
+            try expect(canvas.strokes.isEmpty, "The key typing C clears")
+        }
+
+        testRunner("Every activation starts with an empty canvas, even if a drag outlived Esc") {
+            let overlay = OverlayWindowController()
+            defer { overlay.window.orderOut(nil) }
+            overlay.show()
+            let canvas = overlay.canvasView!
+            canvas.mouseDown(with: mouse(.leftMouseDown, NSPoint(x: 10, y: 10)))
+            canvas.mouseDragged(with: mouse(.leftMouseDragged, NSPoint(x: 50, y: 50)))
+            canvas.keyDown(with: key(kVK_Escape, "\u{1b}", flags: []))
+            // Still dragging during the fade-out: this re-creates a stroke.
+            canvas.mouseDragged(with: mouse(.leftMouseDragged, NSPoint(x: 80, y: 80)))
+            canvas.mouseUp(with: mouse(.leftMouseUp, NSPoint(x: 80, y: 80)))
+            overlay.show()
+            try expect(canvas.strokes.isEmpty, "A stroke from the previous session must not come back (got \(canvas.strokes.count))")
+        }
+
+        testRunner("Activating while already visible keeps the drawing") {
+            let overlay = OverlayWindowController()
+            defer { overlay.window.orderOut(nil) }
+            overlay.show()
+            drawStroke(on: overlay.canvasView, from: NSPoint(x: 10, y: 10), to: NSPoint(x: 60, y: 60))
+            overlay.show()
+            try expect(overlay.canvasView.strokes.count == 1, "Menu 'Activate' on a visible overlay must not wipe it")
+            try expect(overlay.isVisible, "Overlay stays up")
+        }
+
+        testRunner("HotKeyManager releases the shortcut while suspended and restores it") {
+            let combo = hotKey(keyCode: kVK_F10, modifiers: controlKey | optionKey | shiftKey | cmdKey, display: "⌃⌥⇧⌘F10")
+            let defaults = TestDefaults.make()
+            combo.save(to: defaults)
+            let manager = HotKeyManager(defaults: defaults) {}
+            try expect(manager.isRegistered, "Starts registered")
+            manager.suspend()
+            try expect(!manager.isRegistered, "Suspended manager holds no shortcut")
+            do {
+                let otherDefaults = UserDefaults(suiteName: TestDefaults.suiteName + ".B")!
+                defer { otherDefaults.removePersistentDomain(forName: TestDefaults.suiteName + ".B") }
+                combo.save(to: otherDefaults)
+                let other = HotKeyManager(defaults: otherDefaults) {}
+                try expect(other.isRegistered && other.currentHotKey == combo, "The released combination is free for the recorder to press")
+            }
+            manager.resume()
+            try expect(manager.isRegistered && manager.currentHotKey == combo, "Resume re-registers the same shortcut")
+        }
+
+        testRunner("Shortcut recorder reports its dismissal exactly once") {
+            let recorder = ShortcutRecorderWindow()
+            var dismissed = 0
+            recorder.onDismiss = { dismissed += 1 }
+            recorder.show(currentHotKey: .defaultHotKey)
+            recorder.close()
+            try expect(dismissed == 1, "Closing the recorder reports dismissal (got \(dismissed))")
+            recorder.close()
+            try expect(dismissed == 1, "Dismissal is reported once")
         }
 
         testRunner("Scroll wheel, trackpad and [ ] resize pen and spotlight together") {

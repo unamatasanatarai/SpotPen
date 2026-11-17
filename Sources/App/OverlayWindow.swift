@@ -5,13 +5,7 @@ public final class CustomBorderlessWindow: NSWindow {
     public override var canBecomeMain: Bool { return true }
 }
 
-public protocol OverlayWindowDelegate: AnyObject {
-    func overlayWindowDidDismiss()
-}
-
 public final class OverlayWindowController: NSObject, AnnotationCanvasDelegate {
-    public weak var delegate: OverlayWindowDelegate?
-
     public private(set) var window: CustomBorderlessWindow!
     public private(set) var canvasView: AnnotationCanvasView!
 
@@ -81,10 +75,20 @@ public final class OverlayWindowController: NSObject, AnnotationCanvasDelegate {
         }
     }
 
-    /// Shows the overlay on the screen under the mouse.
+    /// Shows the overlay on the screen under the mouse, always with an empty canvas.
+    /// If it is already up, only brings it back into focus and keeps the drawing.
     public func show() {
+        if isVisible {
+            NSApp.activate(ignoringOtherApps: true)
+            window.makeKeyAndOrderFront(nil)
+            window.makeFirstResponder(canvasView)
+            return
+        }
         // Showing again during the fade-out cancels the pending orderOut.
         isHiding = false
+        // A drag still in progress when the previous session was dismissed can commit a stroke
+        // after hide() wiped the canvas; nothing from an earlier session may survive.
+        canvasView.clearAll()
 
         let mouseLocation = NSEvent.mouseLocation
         let targetScreen = NSScreen.screens.first { NSMouseInRect(mouseLocation, $0.frame, false) } ?? NSScreen.main
@@ -122,7 +126,6 @@ public final class OverlayWindowController: NSObject, AnnotationCanvasDelegate {
             self.isHiding = false
             self.window.orderOut(nil)
             self.canvasView.releaseRenderCache()
-            self.delegate?.overlayWindowDidDismiss()
         })
     }
 

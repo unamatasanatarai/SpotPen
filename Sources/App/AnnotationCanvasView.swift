@@ -83,8 +83,6 @@ public final class AnnotationCanvasView: NSView {
 
     // MARK: - State
 
-    // MARK: - State
-
     /// Frees the committed-stroke bitmap (tens of MB on Retina displays) while the overlay is hidden.
     /// It is rebuilt from `strokes` on the next draw.
     public func releaseRenderCache() {
@@ -388,8 +386,10 @@ public final class AnnotationCanvasView: NSView {
             return
         }
 
-        // C (8): clear the screen and keep drawing. Ignored with ⌘/⌃/⌥ so shortcuts aren't swallowed.
-        if event.keyCode == 8, event.modifierFlags.intersection([.command, .control, .option]).isEmpty {
+        // C: clear the screen and keep drawing. Matched by the typed letter so it follows the keyboard
+        // layout; ignored with ⌘/⌃/⌥ so shortcuts aren't swallowed.
+        if event.charactersIgnoringModifiers?.lowercased() == "c",
+           event.modifierFlags.intersection([.command, .control, .option]).isEmpty {
             clearAll()
             return
         }

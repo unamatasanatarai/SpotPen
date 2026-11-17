@@ -76,39 +76,6 @@ public struct SavedHotKey: Codable, Equatable {
         modifierMaskRaw: NSEvent.ModifierFlags([.control]).rawValue
     )
 
-    /// ⌃⌥⌘ combinations are rarely bound by apps, unlike ⌘⇧S (Save As) or ⌥Space (non-breaking space).
-    public static let presets: [SavedHotKey] = [
-        defaultHotKey,
-        SavedHotKey(
-            keyCode: UInt32(kVK_ANSI_A),
-            carbonModifiers: UInt32(controlKey | optionKey | cmdKey),
-            displayString: "⌃⌥⌘A",
-            keyChar: "a",
-            modifierMaskRaw: NSEvent.ModifierFlags([.control, .option, .command]).rawValue
-        ),
-        SavedHotKey(
-            keyCode: UInt32(kVK_ANSI_P),
-            carbonModifiers: UInt32(controlKey | optionKey | cmdKey),
-            displayString: "⌃⌥⌘P",
-            keyChar: "p",
-            modifierMaskRaw: NSEvent.ModifierFlags([.control, .option, .command]).rawValue
-        ),
-        SavedHotKey(
-            keyCode: UInt32(kVK_ANSI_D),
-            carbonModifiers: UInt32(controlKey | optionKey | cmdKey),
-            displayString: "⌃⌥⌘D",
-            keyChar: "d",
-            modifierMaskRaw: NSEvent.ModifierFlags([.control, .option, .command]).rawValue
-        ),
-        SavedHotKey(
-            keyCode: UInt32(kVK_Space),
-            carbonModifiers: UInt32(controlKey | optionKey | cmdKey),
-            displayString: "⌃⌥⌘Space",
-            keyChar: " ",
-            modifierMaskRaw: NSEvent.ModifierFlags([.control, .option, .command]).rawValue
-        )
-    ]
-
     static let defaultsKey = "SpotPen.ToggleHotKey"
 
     /// The saved shortcut, or the default when none is saved or the saved one is no longer allowed.
@@ -254,6 +221,7 @@ public final class HotKeyManager {
     private var action: HotKeyAction?
     private var hotKeyRef: EventHotKeyRef?
     private var eventHandler: EventHandlerRef?
+    private var isSuspended = false
 
     /// The combination currently registered (or the one that was attempted if `isRegistered` is false).
     public private(set) var currentHotKey: SavedHotKey
@@ -332,6 +300,26 @@ public final class HotKeyManager {
             onHotKeyChanged?(hotKey)
         }
         return result
+    }
+
+    /// Releases the shortcut system-wide (e.g. while the recorder is open, so pressing the current
+    /// combination reaches the recorder instead of toggling the overlay). `currentHotKey` is kept.
+    public func suspend() {
+        guard !isSuspended else { return }
+        isSuspended = true
+        if let ref = hotKeyRef {
+            UnregisterEventHotKey(ref)
+            hotKeyRef = nil
+        }
+    }
+
+    /// Re-registers `currentHotKey` after `suspend()`, unless a new shortcut was registered meanwhile.
+    public func resume() {
+        guard isSuspended else { return }
+        isSuspended = false
+        if hotKeyRef == nil {
+            _ = activate(currentHotKey)
+        }
     }
 
     /// Registers the new combination first and only then releases the old one.

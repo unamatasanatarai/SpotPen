@@ -121,8 +121,11 @@ public final class ShortcutRecordContentView: NSView {
 public final class ShortcutRecorderWindow: NSPanel {
     public static let shared = ShortcutRecorderWindow()
     public var onHotKeyRecorded: ((SavedHotKey) -> Result<Void, ShortcutError>)?
+    /// Called once each time the recorder goes away (saved, cancelled, closed, or lost focus).
+    public var onDismiss: (() -> Void)?
     
     private var recordView: ShortcutRecordContentView!
+    private var isRecording = false
     
     public init() {
         super.init(
@@ -141,20 +144,40 @@ public final class ShortcutRecorderWindow: NSPanel {
             return self?.onHotKeyRecorded?(hotKey) ?? .success(())
         }
         recordView.onFinished = { [weak self] in
-            self?.orderOut(nil)
+            self?.dismiss()
         }
         recordView.onCancel = { [weak self] in
-            self?.orderOut(nil)
+            self?.dismiss()
         }
         self.contentView = recordView
     }
     
     public func show(currentHotKey: SavedHotKey) {
+        isRecording = true
         recordView.reset(with: currentHotKey)
         self.center()
         self.makeKeyAndOrderFront(nil)
         NSApp.activate(ignoringOtherApps: true)
         self.makeFirstResponder(recordView)
+    }
+
+    /// Clicking elsewhere ends recording too; otherwise the panel would hide on deactivation
+    /// and leave the global shortcut suspended with no visible way back.
+    public override func resignKey() {
+        super.resignKey()
+        dismiss()
+    }
+
+    public override func close() {
+        super.close()
+        dismiss()
+    }
+
+    private func dismiss() {
+        guard isRecording else { return }
+        isRecording = false
+        orderOut(nil)
+        onDismiss?()
     }
 }
 
